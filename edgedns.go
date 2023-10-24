@@ -14,20 +14,74 @@
 package main
 
 import (
+	"bytes"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
-	"github.com/akamai/AkamaiOPEN-edgegrid-golang/client-v1"
-	dns "github.com/akamai/AkamaiOPEN-edgegrid-golang/configdns-v2"
-	edgegrid "github.com/akamai/AkamaiOPEN-edgegrid-golang/edgegrid"
+	"io"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/akamai/AkamaiOPEN-edgegrid-golang/client-v1"
+	dns "github.com/akamai/AkamaiOPEN-edgegrid-golang/configdns-v2"
+	edgegrid "github.com/akamai/AkamaiOPEN-edgegrid-golang/edgegrid"
 )
 
 const (
 	TrafficRecordTimeOffsetFormat string = "01/02/2006 15:04 GMT-0700"
 	TrafficRecordTimeFormat       string = "01/02/2006 15:04 GMT"
 )
+
+type zonesList struct {
+	Metadata struct {
+		ShowAll       bool `json:"showAll"`
+		TotalElements int  `json:"totalElements"`
+	} `json:"metadata"`
+	Zones []struct {
+		ContractID            string    `json:"contractId"`
+		Zone                  string    `json:"zone"`
+		Category              string    `json:"category"`
+		Type                  string    `json:"type"`
+		Comment               string    `json:"comment,omitempty"`
+		VersionID             string    `json:"versionId"`
+		LastModifiedDate      time.Time `json:"lastModifiedDate"`
+		LastModifiedBy        string    `json:"lastModifiedBy"`
+		AliasCount            int       `json:"aliasCount"`
+		ActivationState       string    `json:"activationState"`
+		SignAndServe          bool      `json:"signAndServe"`
+		SignAndServeAlgorithm string    `json:"signAndServeAlgorithm"`
+		SubzoneGrants         bool      `json:"subzoneGrants"`
+		LastActivationDate    time.Time `json:"lastActivationDate,omitempty"`
+		ActivationMessage     string    `json:"activationMessage,omitempty"`
+	} `json:"zones"`
+}
+
+type DNSReport struct {
+	Metadata struct {
+		Name       string    `json:"name"`
+		Version    string    `json:"version"`
+		OutputType string    `json:"outputType"`
+		GroupBy    []string  `json:"groupBy"`
+		Interval   string    `json:"interval"`
+		Start      time.Time `json:"start"`
+		End        time.Time `json:"end"`
+		RowCount   int       `json:"rowCount"`
+		Columns    []struct {
+			Name  string `json:"name"`
+			Label string `json:"label"`
+		} `json:"columns"`
+		ObjectType string   `json:"objectType"`
+		ObjectIds  []string `json:"objectIds"`
+	} `json:"metadata"`
+	Data []struct {
+		Edns       string `json:"edns"`
+		RecordName string `json:"record_name"`
+		SumHits    string `json:"sum_hits"`
+	} `json:"data"`
+	SummaryStatistics struct {
+	} `json:"summaryStatistics"`
+}
 
 var (
 	// edgegridConfig contains the Akamai OPEN Edgegrid API credentials for automatic signing of requests
@@ -175,7 +229,7 @@ func CreateQueryArgs(startTime, endTime time.Time) *TrafficReportQueryArgs {
 
 }
 
-//  Util function to convert traffic interval time/date to time.Time object
+// Util function to convert traffic interval time/date to time.Time object
 func ConvertTrafficIntervalTime(intervaltime string) (time.Time, error) {
 
 	var ts time.Time
@@ -233,6 +287,118 @@ func ConvertTrafficRecordsResponse(recordsresp TrafficRecordsResponse) TrafficRe
 	}
 	trafficRecordList.TrafficRecords = trafficRecordSlices
 	return trafficRecordList
+}
+
+func GetAllZones() ([]string, error) {
+	var zones []string
+	getURL := "/config-dns/v2/zones"
+	req, err := client.NewRequest(
+		edgegridConfig,
+		"GET",
+		getURL,
+		nil,
+	)
+	if err != nil {
+		return zones, err
+	}
+	req.Header.Add("Accept", "application/json")
+
+	q := req.URL.Query()
+	q.Add("showAll", "true")
+	req.URL.RawQuery = q.Encode()
+
+	edgegrid.PrintHttpRequest(req, true)
+
+	res, err := client.Do(edgegridConfig, req)
+	if err != nil {
+		return zones, err
+	}
+	defer res.Body.Close()
+
+	edgegrid.PrintHttpResponse(res, true)
+
+	if client.IsError(res) {
+		return zones, client.NewAPIError(res)
+	}
+
+	var topZones zonesList
+	r := json.NewDecoder(res.Body)
+	err = r.Decode(&topZones)
+	if err != nil {
+		return zones, err
+	}
+	for _, zone := range topZones.Zones {
+		zones = append(zones, zone.Zone)
+		//fmt.Println(zone.Zone)
+	}
+	return zones, nil
+}
+
+func GetReportAPI(url string, data string) ([]byte, string, error) {
+	var ratelimit string
+	var jsonRes []byte
+	var jsonReq = []byte(data)
+	req, err := client.NewRequest(
+		edgegridConfig,
+		"POST",
+		url,
+		bytes.NewBuffer(jsonReq),
+	)
+	if err != nil {
+		return jsonRes, ratelimit, err
+	}
+	req.Header.Add("Accept", "application/json")
+	current_time := time.Now()
+	q := req.URL.Query()
+	q.Add("end", current_time.UTC().Round(5*time.Minute).Format(time.RFC3339))
+	q.Add("start", current_time.UTC().Add(-time.Hour*24).Round(5*time.Minute).Format(time.RFC3339))
+	q.Add("interval", "FIVE_MINUTES")
+	req.URL.RawQuery = q.Encode()
+
+	edgegrid.PrintHttpRequest(req, true)
+
+	res, err := client.Do(edgegridConfig, req)
+	if err != nil {
+		return jsonRes, ratelimit, err
+	}
+	defer res.Body.Close()
+
+	ratelimit = res.Header.Get("X-Ratelimit-Remaining")
+
+	edgegrid.PrintHttpResponse(res, true)
+
+	if client.IsError(res) {
+		return jsonRes, ratelimit, client.NewAPIError(res)
+	}
+	jsonRes, err = io.ReadAll(res.Body)
+	if err != nil {
+		return jsonRes, ratelimit, err
+	}
+	return jsonRes, ratelimit, nil
+}
+
+func TrafficReportDetail(zone string, url string) (DNSReport, string, error) {
+	var report DNSReport
+	//getURL := "/reporting-api/v1/reports/authoritative-dns-queries-by-zone/versions/1/report-data"
+	//getURL := "/reporting-api/v1/reports/authoritative-dns-nxdomains-by-zone/versions/1/report-data"
+	data := fmt.Sprintf(`
+	{
+		"objectType": "edns",
+		"objectIds": [
+		  "%s"
+		],
+		"metrics": [
+		  "record_name",
+		  "sum_hits"
+		]
+	}`, zone)
+	res, ratelimit, err := GetReportAPI(url, data)
+	if err != nil {
+		return report, ratelimit, err
+	}
+
+	json.Unmarshal(res, &report)
+	return report, ratelimit, nil
 }
 
 // GetTrafficReport retrieves and returns a zone traffic report slice of slices with provided query filters

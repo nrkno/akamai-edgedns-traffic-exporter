@@ -14,6 +14,8 @@
 package main
 
 import (
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
@@ -22,16 +24,15 @@ import (
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 
 	"fmt"
-	client "github.com/akamai/AkamaiOPEN-edgegrid-golang/client-v1"
-	edgegrid "github.com/akamai/AkamaiOPEN-edgegrid-golang/edgegrid"
-	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	edgegrid "github.com/akamai/AkamaiOPEN-edgegrid-golang/edgegrid"
+	"gopkg.in/yaml.v2"
 )
 
 const (
@@ -52,6 +53,7 @@ var (
 	edgegridClientSecret = kingpin.Flag("edgedns.edgegrid-client-secret", "The Akamai Edgegrid client_secret credential.").String()
 	edgegridClientToken  = kingpin.Flag("edgedns.edgegrid-client-token", "The Akamai Edgegrid client_token credential.").String()
 	edgegridAccessToken  = kingpin.Flag("edgedns.edgegrid-access-token", "The Akamai Edgegrid access_token credential.").String()
+	dnsstats             DNSStats
 	//include_estimates	= kingpin.Flag("edgedns.end-time", "Flag to include estimates in traffic reports.").Bool()
 	//time_zone		= kingpin.Flag("edgedns.time-zone", "The timezone to use for start and end time.").String()
 
@@ -73,6 +75,12 @@ type EdgednsTrafficConfig struct {
 type EdgednsTrafficExporter struct {
 	TrafficExporterConfig EdgednsTrafficConfig
 	LastTimestamp         map[string]time.Time // index by zone name
+}
+
+type DNSStats struct {
+	mu         sync.Mutex
+	dnsreports map[string]DNSReport
+	nxdreports map[string]DNSReport
 }
 
 func NewEdgednsTrafficExporter(edgednsConfig EdgednsTrafficConfig, lastTimestamp map[string]time.Time) *EdgednsTrafficExporter {
@@ -126,7 +134,6 @@ func initAkamaiConfig(trafficExporterConfig EdgednsTrafficConfig) error {
 
 // Initialize locally maintained maps
 func createZoneMaps(zones []string) {
-
 	for _, zone := range zones {
 		labels := prometheus.Labels{"zone": zone}
 
@@ -192,6 +199,43 @@ func calcSummaryWindowDuration(window string) error {
 
 }
 
+func syncMetricsWorker(e EdgednsTrafficConfig) {
+	for {
+		for _, zone := range e.Zones {
+			fmt.Println(zone)
+			log.Debugf("Processing zone %s", zone)
+			dnsreport, ratelimit, err := TrafficReportDetail(zone, "/reporting-api/v1/reports/authoritative-dns-queries-by-zone/versions/1/report-data")
+			if err != nil {
+				log.Warnf("Unable to get traffic report for zone %s: %s", zone, err)
+			} else {
+				dnsstats.mu.Lock()
+				dnsstats.dnsreports[zone] = dnsreport
+				dnsstats.mu.Unlock()
+			}
+			if ratelimit == "0" {
+				// add some extra sleep to avoid 429 Rate Limit
+				time.Sleep(30 * time.Second)
+			} else {
+				time.Sleep(2 * time.Second)
+			}
+			nxdreport, ratelimit, err := TrafficReportDetail(zone, "/reporting-api/v1/reports/authoritative-dns-nxdomains-by-zone/versions/1/report-data")
+			if err != nil {
+				log.Warnf("Unable to get traffic report for zone %s: %s", zone, err)
+			} else {
+				dnsstats.mu.Lock()
+				dnsstats.nxdreports[zone] = nxdreport
+				dnsstats.mu.Unlock()
+			}
+			if ratelimit == "0" {
+				// add some extra sleep to avoid 429 Rate Limit
+				time.Sleep(30 * time.Second)
+			} else {
+				time.Sleep(2 * time.Second)
+			}
+		}
+	}
+}
+
 // Describe function
 func (e *EdgednsTrafficExporter) Describe(ch chan<- *prometheus.Desc) {
 
@@ -201,130 +245,30 @@ func (e *EdgednsTrafficExporter) Describe(ch chan<- *prometheus.Desc) {
 // Collect function
 func (e *EdgednsTrafficExporter) Collect(ch chan<- prometheus.Metric) {
 	log.Debugf("Entering EdgeDNS Collect")
-
-	endtime := time.Now().UTC() // Use same current time for all zones
-
-	// TODO: Purge old data points
-
-	// Collect metrics for each zone
-	for _, zone := range e.TrafficExporterConfig.Zones {
-
-		log.Debugf("Processing zone %s", zone)
-
-		// get last timestamp recorded. bump a minute. Make sure at least 5 minutes
-		lasttime := e.LastTimestamp[zone].Add(time.Minute)
-		if endtime.Before(lasttime.Add(time.Minute * 5)) {
-			lasttime = lasttime.Add(time.Minute * 5)
-		}
-		qargs := CreateQueryArgs(lasttime, endtime)
-		log.Debugf("Fetching Report for zone %s. Args: [%v}", zone, qargs)
-		zoneTrafficReport, err := GetTrafficReport(zone, qargs)
-		if err != nil {
-			apierr, ok := err.(client.APIError)
-			if ok && apierr.Status == 500 {
-				log.Warnf("Unable to get traffic report for zone %s. Internal error ... Skipping.", zone)
-				continue
-			}
-			log.Errorf("Unable to get traffic report for zone %s ... Skipping. Error: %s", zone, err.Error())
-			continue
-		}
-		reportList := ConvertTrafficRecordsResponse(zoneTrafficReport)
-		sort.Slice(reportList.TrafficRecords[:], func(i, j int) bool {
-			return reportList.TrafficRecords[i].Timestamp.Before(reportList.TrafficRecords[j].Timestamp)
-		})
-		log.Debugf("Traffic data: [%v]", reportList.TrafficRecords)
-
-		for _, reportInstance := range reportList.TrafficRecords {
-			// TODO: Worry about overwriting existing? Catch for now and skip.
-			if !reportInstance.Timestamp.After(e.LastTimestamp[zone]) {
-				log.Debugf("Instance timestamp: [%v]. Last timestamp: [%v]", reportInstance.Timestamp, e.LastTimestamp[zone])
-				log.Warnf("Attempting to re process report instance: [%v]. Skipping.", reportInstance)
-				continue
-			}
-			// See if we missed an interval. Use averages to fill in.
-			log.Debugf("Instance timestamp: [%v]. Last timestamp: [%v]", reportInstance.Timestamp, e.LastTimestamp[zone])
-			if reportInstance.Timestamp.After(e.LastTimestamp[zone].Add(time.Minute * (trafficReportInterval + 1))) {
-				reportInstance.Timestamp = e.LastTimestamp[zone].Add(time.Minute * trafficReportInterval)
-				log.Debugf("Filling in entry with timestamp: %v", reportInstance.Timestamp)
-				// Missed interval insert with averages
-				dnsLen := int64(len(dnsHitsMap[zone]))
-				var dnsHitsSum int64
-				// calc current rolling dns sum
-				for _, dhit := range dnsHitsMap[zone] {
-					dnsHitsSum += dhit
-				}
-				nxdLen := int64(len(nxdHitsMap[zone]))
-				var nxdHitsSum int64
-				// calc current rolling nxd sum
-				for _, nhit := range nxdHitsMap[zone] {
-					nxdHitsSum += nhit
-				}
-				if dnsLen > 0 {
-					reportInstance.DNSHits = dnsHitsSum / dnsLen
-					reportInstance.NXDHits = nxdHitsSum / nxdLen
-				}
-			}
-
-			// Update rolling hit sums
-			dnsHitsLen := len(dnsHitsMap[zone])
-			if dnsHitsLen == hitsMapCap {
-				// Make room
-				dnsHitsMap[zone] = dnsHitsMap[zone][1:]
-				nxdHitsMap[zone] = nxdHitsMap[zone][1:]
-			}
-			dnsHitsMap[zone] = append(dnsHitsMap[zone], reportInstance.DNSHits)
-			nxdHitsMap[zone] = append(nxdHitsMap[zone], reportInstance.NXDHits)
-			// Check if preserving report instance timestamp as a label
-			var tsLabels = []string{"zone"}
-			if e.TrafficExporterConfig.TSLabel {
-				tsLabels = append(tsLabels, "interval_timestamp")
-			}
-			// DNS Hits
-			ts := reportInstance.Timestamp.Format(time.RFC3339)
-			desc := prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "dns_hits_per_interval"), "Number of DNS hits per 5 minute interval (per zone)", tsLabels, nil)
-			log.Debugf("Creating DNS metric. Zone: %s, Hits: %v, Timestamp: %v", zone, reportInstance.DNSHits, ts)
+	dnsstats.mu.Lock()
+	for zone, metric := range dnsstats.dnsreports {
+		for _, record := range metric.Data {
+			var tsLabels = []string{"zone", "record"}
+			desc := prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "dns_requests_24h"), "Number of DNS hits last 24h per record (5 minute interval)", tsLabels, nil)
 			var dnsmetric prometheus.Metric
-			var nxdmetric prometheus.Metric
-			if e.TrafficExporterConfig.TSLabel {
-				dnsmetric = prometheus.MustNewConstMetric(
-					desc, prometheus.GaugeValue, float64(reportInstance.DNSHits), zone, ts)
-			} else {
-				dnsmetric = prometheus.MustNewConstMetric(
-					desc, prometheus.GaugeValue, float64(reportInstance.DNSHits), zone)
-			}
-			if !e.TrafficExporterConfig.UseTimestamp {
-				ch <- dnsmetric
-			} else {
-				ch <- prometheus.NewMetricWithTimestamp(reportInstance.Timestamp, dnsmetric)
-			}
-			// NXD Hits
-			desc = prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "nxd_hits_per_interval"), "Number of NXD hits per 5 minute interval (per zone)", tsLabels, nil)
-			log.Debugf("Creating NXD metric. Zone: %s, Hits: %v, Timestamp: %v", zone, reportInstance.NXDHits, ts)
-			if e.TrafficExporterConfig.TSLabel {
-				nxdmetric = prometheus.MustNewConstMetric(
-					desc, prometheus.GaugeValue, float64(reportInstance.NXDHits), zone, ts)
-			} else {
-				nxdmetric = prometheus.MustNewConstMetric(
-					desc, prometheus.GaugeValue, float64(reportInstance.NXDHits), zone)
-			}
-			if !e.TrafficExporterConfig.UseTimestamp {
-				ch <- nxdmetric
-			} else {
-				ch <- prometheus.NewMetricWithTimestamp(reportInstance.Timestamp, nxdmetric)
-			}
-			// Summaries
-			dnsSummaryMap[zone].Observe(float64(reportInstance.DNSHits))
-			nxdSummaryMap[zone].Observe(float64(reportInstance.NXDHits))
-
-			// Update last timestamp processed
-			if reportInstance.Timestamp.After(e.LastTimestamp[zone]) {
-				log.Debugf("Updating Last Timestamp from %v TO %v", e.LastTimestamp[zone], reportInstance.Timestamp)
-				e.LastTimestamp[zone] = reportInstance.Timestamp
-			}
-			// only process one each interval!
-			break
+			sumhits, _ := strconv.Atoi(record.SumHits)
+			dnsmetric = prometheus.MustNewConstMetric(
+				desc, prometheus.GaugeValue, float64(sumhits), zone, record.RecordName)
+			ch <- dnsmetric
 		}
 	}
+	for zone, metric := range dnsstats.nxdreports {
+		for _, record := range metric.Data {
+			var tsLabels = []string{"zone", "record"}
+			desc := prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "nxd_requests_24h"), "Number of NXDOMAIN hits last 24h per record (5 minute interval)", tsLabels, nil)
+			var dnsmetric prometheus.Metric
+			sumhits, _ := strconv.Atoi(record.SumHits)
+			dnsmetric = prometheus.MustNewConstMetric(
+				desc, prometheus.GaugeValue, float64(sumhits), zone, record.RecordName)
+			ch <- dnsmetric
+		}
+	}
+	dnsstats.mu.Unlock()
 }
 
 func init() {
@@ -339,9 +283,6 @@ func main() {
 	kingpin.Parse()
 
 	log.Infof("Config file: %s", *configFile)
-	// TODO: Remove
-	//log.Infof("Start: %s", *start)
-	//log.Infof("Start Time: %s", *start_time)
 
 	log.Info("Starting Edge DNS Traffic exporter", version.Info())
 	log.Info("Build context", version.BuildContext())
@@ -359,6 +300,15 @@ func main() {
 		log.Fatalf("Error initializing Akamai Edgegrid config: %s", err.Error())
 	}
 
+	zones, err := GetAllZones()
+	if err != nil {
+		fmt.Println(err)
+	}
+	edgednsTrafficConfig.Zones = zones
+	dnsstats.dnsreports = make(map[string]DNSReport) // init map
+	dnsstats.nxdreports = make(map[string]DNSReport) // init map
+	go syncMetricsWorker(edgednsTrafficConfig)       // start sync goroutine
+
 	tstart := time.Now().UTC().Add(time.Minute * time.Duration(trafficReportInterval*-1)) // assume start time is Exporter launch less 5 mins
 	if edgednsTrafficConfig.SummaryWindow != "" {
 		err = calcSummaryWindowDuration(edgednsTrafficConfig.SummaryWindow)
@@ -370,39 +320,8 @@ func main() {
 	} else {
 		log.Warnf("Retention window is not configured. Using default (%d days)", lookbackDefaultDays)
 	}
-	// TODO: DO we want to expose start time or only lookback window?
-	/*
-		if len(*start) > 0 && len(*start_time) > 0 {
-			serr := validateTrafficDate(*start)
-			sterr := validateTrafficTime(*start_time)
-			if serr != nil {
-				log.Warnf("start validation failed: %s. Using current date and time", err.Error())
-			} else if sterr != nil {
-				log.Warnf("start_time validation failed: %s. Using current date and time", err.Error())
-			} else {
-				s := *start
-				st := *start_time
-				yr, _ := strconv.Atoi(s[0:4])
-				mn, _ := strconv.Atoi(s[4:6])
-				dy, _ := strconv.Atoi(s[6:8])
-				hr, _ := strconv.Atoi(st[0:2])
-				mm, _ := strconv.Atoi(st[3:5])
-				tstart = time.Date(
-					yr,
-					time.Month(mn),
-					dy,
-					hr,
-					mm,
-					0,
-					0,
-					time.UTC)
-			}
-		}
-	*/
-
 	log.Infof("Edge DNS Traffic exporter start time: %v", tstart)
 
-	// Populate LastTimestamp per Zone. Start time applies to all.
 	lastTimeStamp := make(map[string]time.Time) // index by zone name
 	for _, zone := range edgednsTrafficConfig.Zones {
 		lastTimeStamp[zone] = tstart
@@ -413,13 +332,13 @@ func main() {
 	prometheus.MustRegister(edgednsTrafficCollector)
 
 	// Create and register Summaries
-	createZoneMaps(edgednsTrafficConfig.Zones)
-	for _, sum := range dnsSummaryMap {
-		prometheus.MustRegister(sum)
-	}
-	for _, sum := range nxdSummaryMap {
-		prometheus.MustRegister(sum)
-	}
+	//createZoneMaps(edgednsTrafficConfig.Zones)
+	//for _, sum := range dnsSummaryMap {
+	//	prometheus.MustRegister(sum)
+	//}
+	//for _, sum := range nxdSummaryMap {
+	//	prometheus.MustRegister(sum)
+	//}
 
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -455,6 +374,7 @@ func loadConfig(configFile string) (EdgednsTrafficConfig, error) {
 
 func loadConfigContent(configData []byte) (EdgednsTrafficConfig, error) {
 	config := EdgednsTrafficConfig{}
+
 	err := yaml.Unmarshal(configData, &config)
 	if err != nil {
 		return config, err
