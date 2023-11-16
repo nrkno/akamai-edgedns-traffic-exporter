@@ -4,9 +4,10 @@ go 1.14
 
 require (
 	github.com/akamai/AkamaiOPEN-edgegrid-golang v1.0.0
+	github.com/hashicorp/vault/api v1.10.0 // indirect
 	github.com/prometheus/client_golang v1.7.1
 	github.com/prometheus/common v0.15.0
-	github.com/stretchr/testify v1.4.0
+	github.com/stretchr/testify v1.8.4
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/h2non/gock.v1 v1.0.15
 	gopkg.in/yaml.v2 v2.4.0

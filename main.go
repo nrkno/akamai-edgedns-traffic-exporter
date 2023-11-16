@@ -14,6 +14,7 @@
 package main
 
 import (
+	"errors"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -33,6 +34,8 @@ import (
 
 	edgegrid "github.com/akamai/AkamaiOPEN-edgegrid-golang/edgegrid"
 	"gopkg.in/yaml.v2"
+
+	vault "github.com/hashicorp/vault/api"
 )
 
 const (
@@ -53,6 +56,7 @@ var (
 	edgegridClientSecret = kingpin.Flag("edgedns.edgegrid-client-secret", "The Akamai Edgegrid client_secret credential.").String()
 	edgegridClientToken  = kingpin.Flag("edgedns.edgegrid-client-token", "The Akamai Edgegrid client_token credential.").String()
 	edgegridAccessToken  = kingpin.Flag("edgedns.edgegrid-access-token", "The Akamai Edgegrid access_token credential.").String()
+	vaultPath            = kingpin.Flag("edgedns.vault-path", "The Vault secret path").String()
 	dnsstats             DNSStats
 	//include_estimates	= kingpin.Flag("edgedns.end-time", "Flag to include estimates in traffic reports.").Bool()
 	//time_zone		= kingpin.Flag("edgedns.time-zone", "The timezone to use for start and end time.").String()
@@ -119,6 +123,32 @@ func initAkamaiConfig(trafficExporterConfig EdgednsTrafficConfig) error {
 		log.Warnf("Command line Auth Keys are incomplete. Looking for alternate definitions.")
 	}
 
+	// Fetch from Vault
+	vaultAddr := os.Getenv("VAULT_ADDR")
+	if vaultAddr != "" {
+		var httpClient = &http.Client{
+			Timeout: 10 * time.Second,
+		}
+
+		client, err := vault.NewClient(&vault.Config{Address: vaultAddr, HttpClient: httpClient})
+		if err != nil {
+			return err
+		}
+		secret, err := client.Logical().Read(*vaultPath)
+		if err != nil {
+			return err
+		}
+		if secret == nil {
+			return errors.New("no value found at " + *vaultPath)
+		}
+		edgeconf := edgegrid.Config{}
+		edgeconf.Host = secret.Data["host"].(string)
+		edgeconf.ClientToken = secret.Data["client_token"].(string)
+		edgeconf.ClientSecret = secret.Data["client_secret"].(string)
+		edgeconf.AccessToken = secret.Data["access_token"].(string)
+		edgeconf.MaxBody = 131072
+		return edgeInit(edgeconf)
+	}
 	// Edgegrid will also check for environment variables ...
 	err := EdgegridInit(trafficExporterConfig.EdgercPath, trafficExporterConfig.EdgercSection)
 	if err != nil {

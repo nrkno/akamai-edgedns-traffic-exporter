@@ -1,3 +1,6 @@
 vendor/
 akamai-dns
 build/
+edgedns.yml
+akamai-edgedns-traffic-exporter
+.edgerc
